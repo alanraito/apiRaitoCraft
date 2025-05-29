@@ -3,7 +3,7 @@
   Descrição: Este arquivo configura e executa o servidor backend da aplicação Calculadora de Craft Pokexgames.
   Ele utiliza Express.js para roteamento e manipulação de requisições HTTP, e SQLite como banco de dados
   para persistir as receitas dos itens. O servidor expõe uma API RESTful para operações CRUD (Create, Read,
-  Update, Delete) sobre as receitas.
+  Update, Delete) sobre as receitas, além de rotas analíticas.
   Principais Funcionalidades:
   - Conexão e Inicialização do Banco de Dados: Estabelece a conexão com o arquivo de banco de dados SQLite
     (criando-o se não existir) e executa um schema SQL (`schema.sql`) para garantir que as tabelas
@@ -11,17 +11,17 @@
   - Middlewares: Utiliza `cors` para permitir requisições de diferentes origens (Cross-Origin Resource Sharing)
     e `express.json()` para parsear corpos de requisição no formato JSON.
   - Rotas da API:
-    - GET /api/items: Retorna uma lista de todos os itens craftáveis. Crucialmente, esta rota foi
-                      modificada para também incluir os materiais associados a cada item na resposta,
-                      evitando a necessidade de múltiplas chamadas da API pelo frontend para obter
-                      esta informação.
+    - GET /api/items: Retorna uma lista de todos os itens craftáveis, incluindo seus materiais.
     - GET /api/items/:id/recipe: Retorna os detalhes completos de uma receita específica, incluindo seus materiais.
-    - GET /api/items/name/:name: Busca um item pelo nome (usado para obter o preço NPC, por exemplo).
-    - POST /api/items: Cria uma nova receita de item, incluindo seus materiais, no banco de dados.
-                       Utiliza transações para garantir a atomicidade da operação.
-    - PUT /api/items/:id: Atualiza uma receita de item existente e seus materiais.
-                          Também utiliza transações.
-    - DELETE /api/items/:id: Remove uma receita de item do banco de dados.
+    - GET /api/items/name/:name: Busca um item pelo nome.
+    - POST /api/items: Cria uma nova receita de item.
+    - PUT /api/items/:id: Atualiza uma receita de item existente.
+    - DELETE /api/items/:id: Remove uma receita de item.
+    - GET /api/items/by-material: Retorna itens que usam um material específico.
+    - GET /api/items/most-profitable-npc: Retorna itens ordenados por lucratividade considerando apenas preços NPC.
+    - GET /api/items/filter-by-material-profile: Filtra itens com base no perfil de tipo de seus materiais.
+    - GET /api/materials/usage-summary: Fornece um sumário do uso de materiais em todas as receitas.
+    - POST /api/crafting/check-possibilities: (NOVO) Verifica quais itens podem ser fabricados com base nos materiais fornecidos pelo usuário.
     - GET /health: Uma rota simples para verificar a saúde do servidor.
   - Tratamento de Erro: Um middleware genérico para capturar e responder a erros não tratados.
   - Inicialização do Servidor: Inicia o servidor Express para escutar na porta configurada (padrão 3000).
@@ -236,6 +236,253 @@ app.delete('/api/items/:id', (req, res) => {
         res.status(200).json({ message: 'Receita deletada com sucesso!' });
     });
 });
+
+app.get('/api/items/by-material', (req, res) => {
+    const materialName = req.query.materialName;
+    if (!materialName) {
+        return res.status(400).json({ error: 'Nome do material é obrigatório na query string (materialName).' });
+    }
+    const sqlRecipes = "SELECT id, name, quantity_produced, npc_sell_price FROM recipes ORDER BY name ASC";
+    const sqlMaterials = "SELECT recipe_id, material_name, quantity, material_type, default_npc_price FROM recipe_materials";
+
+    db.all(sqlRecipes, [], (err, recipes) => {
+        if (err) {
+            console.error("Erro na query GET /api/items/by-material (recipes):", err.message);
+            return res.status(500).json({ error: 'Erro interno do servidor ao buscar itens.' });
+        }
+        if (!recipes || recipes.length === 0) { return res.json([]); }
+        db.all(sqlMaterials, [], (err, materials) => {
+            if (err) {
+                console.error("Erro na query GET /api/items/by-material (materials):", err.message);
+                return res.status(500).json({ error: 'Erro interno do servidor ao buscar materiais.' });
+            }
+            const recipesUsingMaterial = recipes.filter(recipe => {
+                const recipeMaterials = materials.filter(m => m.recipe_id === recipe.id);
+                return recipeMaterials.some(m => m.material_name.toLowerCase() === materialName.toLowerCase());
+            }).map(recipe => {
+                return {
+                    ...recipe,
+                    materials: materials.filter(material => material.recipe_id === recipe.id)
+                                     .map(({ recipe_id, ...rest }) => rest)
+                };
+            });
+            res.json(recipesUsingMaterial);
+        });
+    });
+});
+
+app.get('/api/items/most-profitable-npc', (req, res) => {
+    const sqlRecipes = "SELECT id, name, quantity_produced, npc_sell_price FROM recipes";
+    const sqlMaterials = "SELECT recipe_id, material_name, quantity, material_type, default_npc_price FROM recipe_materials";
+
+    db.all(sqlRecipes, [], (err, recipes) => {
+        if (err) {
+            console.error("Erro na query GET /api/items/most-profitable-npc (recipes):", err.message);
+            return res.status(500).json({ error: 'Erro interno do servidor ao buscar itens para cálculo de lucro.' });
+        }
+        if (!recipes || recipes.length === 0) { return res.json([]); }
+        db.all(sqlMaterials, [], (err, materials) => {
+            if (err) {
+                console.error("Erro na query GET /api/items/most-profitable-npc (materials):", err.message);
+                return res.status(500).json({ error: 'Erro interno do servidor ao buscar materiais para cálculo de lucro.' });
+            }
+            const profitableItems = recipes.map(recipe => {
+                const recipeMaterials = materials.filter(m => m.recipe_id === recipe.id);
+                let totalMaterialCostNpc = 0;
+                for (const mat of recipeMaterials) {
+                    if (mat.material_type === 'profession') { continue; }
+                    totalMaterialCostNpc += (mat.quantity * (mat.default_npc_price || 0));
+                }
+                const totalRevenueNpc = (recipe.npc_sell_price || 0) * (recipe.quantity_produced || 1);
+                const profitNpc = totalRevenueNpc - totalMaterialCostNpc;
+                return {
+                    id: recipe.id,
+                    name: recipe.name,
+                    quantity_produced: recipe.quantity_produced,
+                    npc_sell_price_per_unit: recipe.npc_sell_price,
+                    total_revenue_npc: totalRevenueNpc,
+                    total_material_cost_npc: totalMaterialCostNpc,
+                    profit_npc: profitNpc,
+                };
+            }).sort((a, b) => b.profit_npc - a.profit_npc);
+            res.json(profitableItems);
+        });
+    });
+});
+
+app.get('/api/items/filter-by-material-profile', (req, res) => {
+    const { materialTypes: materialTypesQuery, matchProfile = 'exclusive' } = req.query;
+
+    if (!materialTypesQuery) {
+        return res.status(400).json({ error: 'O parâmetro "materialTypes" é obrigatório (ex: "profession" ou "drop,buy").' });
+    }
+    const validProfiles = ['exclusive', 'contains_any', 'contains_all', 'not_contains_any'];
+    if (!validProfiles.includes(matchProfile)) {
+        return res.status(400).json({ error: `Valor inválido para "matchProfile". Válidos: ${validProfiles.join(', ')}.` });
+    }
+    const typesArray = materialTypesQuery.toLowerCase().split(',').map(t => t.trim()).filter(t => t);
+    if (typesArray.length === 0) {
+         return res.status(400).json({ error: 'Nenhum tipo de material válido fornecido em "materialTypes".' });
+    }
+
+    const sqlRecipes = "SELECT id, name, quantity_produced, npc_sell_price FROM recipes ORDER BY name ASC";
+    const sqlMaterials = "SELECT recipe_id, material_name, quantity, material_type, default_npc_price FROM recipe_materials";
+
+    db.all(sqlRecipes, [], (err, recipes) => {
+        if (err) { return res.status(500).json({ error: 'Erro ao buscar receitas.' }); }
+        if (!recipes || recipes.length === 0) { return res.json([]); }
+
+        db.all(sqlMaterials, [], (err, materials) => {
+            if (err) { return res.status(500).json({ error: 'Erro ao buscar materiais.' }); }
+
+            const filteredRecipes = recipes.filter(recipe => {
+                const recipeMats = materials.filter(m => m.recipe_id === recipe.id);
+                if (recipeMats.length === 0 && (matchProfile === 'exclusive' || matchProfile === 'not_contains_any')) {
+                    return matchProfile === 'not_contains_any';
+                }
+                 if (recipeMats.length === 0) return false;
+
+                switch (matchProfile) {
+                    case 'exclusive':
+                        return recipeMats.every(m => typesArray.includes(m.material_type.toLowerCase()));
+                    case 'contains_any':
+                        return recipeMats.some(m => typesArray.includes(m.material_type.toLowerCase()));
+                    case 'contains_all':
+                        return typesArray.every(type => recipeMats.some(m => m.material_type.toLowerCase() === type));
+                    case 'not_contains_any':
+                        return !recipeMats.some(m => typesArray.includes(m.material_type.toLowerCase()));
+                    default:
+                        return false;
+                }
+            }).map(recipe => ({
+                ...recipe,
+                materials: materials.filter(material => material.recipe_id === recipe.id)
+                                 .map(({ recipe_id, ...rest }) => rest)
+            }));
+            res.json(filteredRecipes);
+        });
+    });
+});
+
+app.get('/api/materials/usage-summary', (req, res) => {
+    const { materialName: materialNameQuery, materialTypes: materialTypesQuery } = req.query;
+
+    let baseSql = "SELECT material_name, material_type, SUM(quantity) as total_quantity_needed, COUNT(DISTINCT recipe_id) as used_in_recipes_count FROM recipe_materials";
+    const conditions = [];
+    const params = [];
+
+    if (materialNameQuery) {
+        conditions.push("material_name LIKE ?");
+        params.push(`%${materialNameQuery}%`);
+    }
+    if (materialTypesQuery) {
+        const typesArray = materialTypesQuery.toLowerCase().split(',').map(t => t.trim()).filter(t => t);
+        if (typesArray.length > 0) {
+            conditions.push(`material_type IN (${typesArray.map(() => '?').join(',')})`);
+            params.push(...typesArray);
+        }
+    }
+
+    if (conditions.length > 0) {
+        baseSql += " WHERE " + conditions.join(" AND ");
+    }
+    baseSql += " GROUP BY material_name, material_type ORDER BY used_in_recipes_count DESC, total_quantity_needed DESC, material_name ASC";
+
+    db.all(baseSql, params, (err, rows) => {
+        if (err) {
+            console.error("Erro na query GET /api/materials/usage-summary:", err.message);
+            return res.status(500).json({ error: 'Erro interno do servidor ao buscar sumário de materiais.' });
+        }
+        res.json(rows);
+    });
+});
+
+// NOVO ENDPOINT: POST /api/crafting/check-possibilities
+app.post('/api/crafting/check-possibilities', (req, res) => {
+    const { availableMaterials } = req.body;
+
+    if (!availableMaterials || !Array.isArray(availableMaterials)) {
+        return res.status(400).json({ error: 'O corpo da requisição deve conter um array "availableMaterials".' });
+    }
+
+    // Mapeia os materiais disponíveis para fácil acesso: { "NomeMaterial": quantidade }
+    const userInventory = availableMaterials.reduce((acc, mat) => {
+        if (mat.material_name && typeof mat.quantity === 'number' && mat.quantity >= 0) {
+            acc[mat.material_name.toLowerCase()] = (acc[mat.material_name.toLowerCase()] || 0) + mat.quantity;
+        }
+        return acc;
+    }, {});
+
+    if (Object.keys(userInventory).length === 0) {
+        return res.status(400).json({ error: 'Nenhum material válido fornecido em "availableMaterials". Cada material deve ter "material_name" e "quantity".' });
+    }
+
+    const sqlRecipes = "SELECT id, name, quantity_produced, npc_sell_price FROM recipes";
+    const sqlAllRecipeMaterials = "SELECT recipe_id, material_name, quantity FROM recipe_materials";
+
+    db.all(sqlRecipes, [], (err, recipes) => {
+        if (err) { return res.status(500).json({ error: 'Erro ao buscar receitas para verificar possibilidades.' }); }
+        if (!recipes || recipes.length === 0) { return res.json([]); }
+
+        db.all(sqlAllRecipeMaterials, [], (err, allMaterials) => {
+            if (err) { return res.status(500).json({ error: 'Erro ao buscar materiais de receita para verificar possibilidades.' }); }
+
+            const craftableItems = [];
+
+            recipes.forEach(recipe => {
+                const materialsNeededForRecipe = allMaterials.filter(m => m.recipe_id === recipe.id);
+
+                if (materialsNeededForRecipe.length === 0) { // Receita sem materiais pode ser feita "infinitamente" (ou 1 vez, se preferir)
+                    craftableItems.push({
+                        recipe_id: recipe.id,
+                        recipe_name: recipe.name,
+                        quantity_produced_per_craft: recipe.quantity_produced,
+                        max_crafts_possible: Infinity, // Ou um número grande, ou 1, dependendo da regra de negócio para receitas sem material
+                        materials_needed: []
+                    });
+                    return; // Próxima receita
+                }
+
+                let canCraftRecipe = true;
+                let maxCraftsForThisRecipe = Infinity;
+
+                for (const neededMat of materialsNeededForRecipe) {
+                    const userHasQty = userInventory[neededMat.material_name.toLowerCase()] || 0;
+                    const neededQtyPerCraft = neededMat.quantity;
+
+                    if (userHasQty < neededQtyPerCraft) {
+                        canCraftRecipe = false;
+                        break; // Usuário não tem material suficiente para 1 craft
+                    }
+                    // Calcula quantas vezes este material específico permite fazer a receita
+                    const possibleCraftsWithThisMaterial = Math.floor(userHasQty / neededQtyPerCraft);
+                    if (possibleCraftsWithThisMaterial < maxCraftsForThisRecipe) {
+                        maxCraftsForThisRecipe = possibleCraftsWithThisMaterial;
+                    }
+                }
+
+                if (canCraftRecipe && maxCraftsForThisRecipe > 0) {
+                    craftableItems.push({
+                        recipe_id: recipe.id,
+                        recipe_name: recipe.name,
+                        quantity_produced_per_craft: recipe.quantity_produced,
+                        max_crafts_possible: maxCraftsForThisRecipe,
+                        total_items_producible: maxCraftsForThisRecipe * recipe.quantity_produced,
+                        materials_needed: materialsNeededForRecipe.map(m => ({
+                            material_name: m.material_name,
+                            quantity_per_craft: m.quantity,
+                            total_quantity_needed_for_max_crafts: m.quantity * maxCraftsForThisRecipe,
+                            user_has_quantity: userInventory[m.material_name.toLowerCase()] || 0
+                        }))
+                    });
+                }
+            });
+
+            res.json(craftableItems.sort((a,b) => b.max_crafts_possible - a.max_crafts_possible));
+        });
+    });
+});
+
 
 app.use((err, req, res, next) => {
     console.error("Erro não tratado:", err.stack);
