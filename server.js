@@ -13,15 +13,16 @@
   - Rotas da API:
     - GET /api/items: Retorna uma lista de todos os itens craftáveis, incluindo seus materiais.
     - GET /api/items/:id/recipe: Retorna os detalhes completos de uma receita específica, incluindo seus materiais.
-    - GET /api/items/name/:name: Busca um item pelo nome.
+    - GET /api/items/name/:name: Busca um item pelo nome e retorna seu preço NPC.
     - POST /api/items: Cria uma nova receita de item.
     - PUT /api/items/:id: Atualiza uma receita de item existente.
     - DELETE /api/items/:id: Remove uma receita de item.
     - GET /api/items/by-material: Retorna itens que usam um material específico.
     - GET /api/items/most-profitable-npc: Retorna itens ordenados por lucratividade considerando apenas preços NPC.
     - GET /api/items/filter-by-material-profile: Filtra itens com base no perfil de tipo de seus materiais.
-    - GET /api/materials/usage-summary: Fornece um sumário do uso de materiais em todas as receitas.
-    - POST /api/crafting/check-possibilities: (NOVO) Verifica quais itens podem ser fabricados com base nos materiais fornecidos pelo usuário.
+    - GET /api/materials/usage-summary: Fornece um sumário do uso de materiais, podendo incluir preço NPC para consultas específicas.
+    - POST /api/crafting/check-possibilities: Verifica quais itens podem ser fabricados com base nos materiais fornecidos pelo usuário.
+    - POST /api/crafting/analyze-potential-crafts: Analisa receitas que usam os materiais fornecidos, detalhando materiais faltantes e crafts possíveis.
     - GET /health: Uma rota simples para verificar a saúde do servidor.
   - Tratamento de Erro: Um middleware genérico para capturar e responder a erros não tratados.
   - Inicialização do Servidor: Inicia o servidor Express para escutar na porta configurada (padrão 3000).
@@ -130,7 +131,7 @@ app.get('/api/items/:id/recipe', (req, res) => {
 
 app.get('/api/items/name/:name', (req, res) => {
     const itemName = req.params.name;
-    const sql = "SELECT npc_sell_price FROM recipes WHERE name = ?";
+    const sql = "SELECT npc_sell_price FROM recipes WHERE LOWER(name) = LOWER(?)";
     db.get(sql, [itemName], (err, row) => {
         if (err) {
             console.error("Erro ao buscar item por nome:", err.message);
@@ -367,14 +368,21 @@ app.get('/api/items/filter-by-material-profile', (req, res) => {
 app.get('/api/materials/usage-summary', (req, res) => {
     const { materialName: materialNameQuery, materialTypes: materialTypesQuery } = req.query;
 
-    let baseSql = "SELECT material_name, material_type, SUM(quantity) as total_quantity_needed, COUNT(DISTINCT recipe_id) as used_in_recipes_count FROM recipe_materials";
+    let baseSql = "SELECT material_name, material_type, SUM(quantity) as total_quantity_needed, COUNT(DISTINCT recipe_id) as used_in_recipes_count";
+    let priceColumn = "";
     const conditions = [];
     const params = [];
 
     if (materialNameQuery) {
-        conditions.push("material_name LIKE ?");
+        conditions.push("LOWER(material_name) LIKE LOWER(?)");
         params.push(`%${materialNameQuery}%`);
+        // Tenta adicionar o preço NPC se um nome específico for consultado.
+        // Pega o MAX pois deve ser consistente; se houver variações, isso pode não ser ideal, mas é uma aproximação.
+        priceColumn = ", (SELECT MAX(rm_price.default_npc_price) FROM recipe_materials rm_price WHERE LOWER(rm_price.material_name) = LOWER(recipe_materials.material_name) AND rm_price.material_type = recipe_materials.material_type AND rm_price.material_type != 'profession') as default_npc_price";
     }
+    
+    baseSql = `SELECT material_name, material_type, SUM(quantity) as total_quantity_needed, COUNT(DISTINCT recipe_id) as used_in_recipes_count ${priceColumn} FROM recipe_materials`;
+
     if (materialTypesQuery) {
         const typesArray = materialTypesQuery.toLowerCase().split(',').map(t => t.trim()).filter(t => t);
         if (typesArray.length > 0) {
@@ -386,7 +394,14 @@ app.get('/api/materials/usage-summary', (req, res) => {
     if (conditions.length > 0) {
         baseSql += " WHERE " + conditions.join(" AND ");
     }
-    baseSql += " GROUP BY material_name, material_type ORDER BY used_in_recipes_count DESC, total_quantity_needed DESC, material_name ASC";
+    baseSql += " GROUP BY material_name, material_type";
+    if(materialNameQuery) { // Se estamos pegando preço, precisamos agrupar por ele também se ele for fixo por material+tipo
+         // No entanto, a subquery para o preço já o torna único por material_name e material_type,
+         // então o GROUP BY principal não precisa incluir explicitamente default_npc_price se ele vier da subquery.
+         // Se default_npc_price fosse uma coluna direta e não agregada, seria necessário no GROUP BY.
+         // Como está na subquery, o GROUP BY material_name, material_type é suficiente.
+    }
+    baseSql += " ORDER BY used_in_recipes_count DESC, total_quantity_needed DESC, material_name ASC";
 
     db.all(baseSql, params, (err, rows) => {
         if (err) {
@@ -397,7 +412,6 @@ app.get('/api/materials/usage-summary', (req, res) => {
     });
 });
 
-// NOVO ENDPOINT: POST /api/crafting/check-possibilities
 app.post('/api/crafting/check-possibilities', (req, res) => {
     const { availableMaterials } = req.body;
 
@@ -405,7 +419,6 @@ app.post('/api/crafting/check-possibilities', (req, res) => {
         return res.status(400).json({ error: 'O corpo da requisição deve conter um array "availableMaterials".' });
     }
 
-    // Mapeia os materiais disponíveis para fácil acesso: { "NomeMaterial": quantidade }
     const userInventory = availableMaterials.reduce((acc, mat) => {
         if (mat.material_name && typeof mat.quantity === 'number' && mat.quantity >= 0) {
             acc[mat.material_name.toLowerCase()] = (acc[mat.material_name.toLowerCase()] || 0) + mat.quantity;
@@ -413,7 +426,7 @@ app.post('/api/crafting/check-possibilities', (req, res) => {
         return acc;
     }, {});
 
-    if (Object.keys(userInventory).length === 0) {
+    if (Object.keys(userInventory).length === 0 && availableMaterials.length > 0 ) {
         return res.status(400).json({ error: 'Nenhum material válido fornecido em "availableMaterials". Cada material deve ter "material_name" e "quantity".' });
     }
 
@@ -432,15 +445,15 @@ app.post('/api/crafting/check-possibilities', (req, res) => {
             recipes.forEach(recipe => {
                 const materialsNeededForRecipe = allMaterials.filter(m => m.recipe_id === recipe.id);
 
-                if (materialsNeededForRecipe.length === 0) { // Receita sem materiais pode ser feita "infinitamente" (ou 1 vez, se preferir)
+                if (materialsNeededForRecipe.length === 0) {
                     craftableItems.push({
                         recipe_id: recipe.id,
                         recipe_name: recipe.name,
                         quantity_produced_per_craft: recipe.quantity_produced,
-                        max_crafts_possible: Infinity, // Ou um número grande, ou 1, dependendo da regra de negócio para receitas sem material
+                        max_crafts_possible: Infinity, 
                         materials_needed: []
                     });
-                    return; // Próxima receita
+                    return; 
                 }
 
                 let canCraftRecipe = true;
@@ -452,16 +465,16 @@ app.post('/api/crafting/check-possibilities', (req, res) => {
 
                     if (userHasQty < neededQtyPerCraft) {
                         canCraftRecipe = false;
-                        break; // Usuário não tem material suficiente para 1 craft
+                        maxCraftsForThisRecipe = 0; 
+                        break; 
                     }
-                    // Calcula quantas vezes este material específico permite fazer a receita
                     const possibleCraftsWithThisMaterial = Math.floor(userHasQty / neededQtyPerCraft);
                     if (possibleCraftsWithThisMaterial < maxCraftsForThisRecipe) {
                         maxCraftsForThisRecipe = possibleCraftsWithThisMaterial;
                     }
                 }
 
-                if (canCraftRecipe && maxCraftsForThisRecipe > 0) {
+                if (canCraftRecipe && maxCraftsForThisRecipe > 0 && maxCraftsForThisRecipe !== Infinity) {
                     craftableItems.push({
                         recipe_id: recipe.id,
                         recipe_name: recipe.name,
@@ -479,6 +492,125 @@ app.post('/api/crafting/check-possibilities', (req, res) => {
             });
 
             res.json(craftableItems.sort((a,b) => b.max_crafts_possible - a.max_crafts_possible));
+        });
+    });
+});
+
+app.post('/api/crafting/analyze-potential-crafts', (req, res) => {
+    const { userMaterials } = req.body;
+
+    if (!userMaterials || !Array.isArray(userMaterials)) {
+        return res.status(400).json({ error: 'O corpo da requisição deve conter um array "userMaterials".' });
+    }
+
+    const userInventory = userMaterials.reduce((acc, mat) => {
+        if (mat.material_name && typeof mat.quantity === 'number' && mat.quantity >= 0) {
+            acc[mat.material_name.toLowerCase()] = (acc[mat.material_name.toLowerCase()] || 0) + mat.quantity;
+        }
+        return acc;
+    }, {});
+
+    if (Object.keys(userInventory).length === 0 && userMaterials.length > 0) {
+         return res.status(400).json({ error: 'Nenhum material válido fornecido em "userMaterials". Cada material deve ter "material_name" e "quantity".' });
+    }
+
+    const sqlRecipes = "SELECT id, name, quantity_produced FROM recipes";
+    const sqlAllRecipeMaterials = "SELECT recipe_id, material_name, quantity, material_type FROM recipe_materials";
+
+    db.all(sqlRecipes, [], (err, recipes) => {
+        if (err) { return res.status(500).json({ error: 'Erro ao buscar receitas para análise.' }); }
+        if (!recipes || recipes.length === 0) { return res.json([]); }
+
+        db.all(sqlAllRecipeMaterials, [], (err, allMaterials) => {
+            if (err) { return res.status(500).json({ error: 'Erro ao buscar materiais de receita para análise.' }); }
+
+            const analysisResults = [];
+
+            recipes.forEach(recipe => {
+                const materialsNeededForThisRecipe = allMaterials.filter(m => m.recipe_id === recipe.id);
+                
+                let recipeUsesAnyUserMaterial = false;
+                if (Object.keys(userInventory).length > 0) {
+                    recipeUsesAnyUserMaterial = materialsNeededForThisRecipe.some(neededMat => 
+                        userInventory.hasOwnProperty(neededMat.material_name.toLowerCase())
+                    );
+                } else { // Se userMaterials for um array vazio, analisar todas as receitas
+                    recipeUsesAnyUserMaterial = true;
+                }
+
+                if (!recipeUsesAnyUserMaterial && Object.keys(userInventory).length > 0) { // Não mostrar se usuário especificou materiais e esta receita não usa nenhum deles
+                    return; 
+                }
+                
+                let craftableNowCount = Infinity;
+                let canCraftAnyWithCurrentMaterials = true;
+
+                const materialsAnalysis = materialsNeededForThisRecipe.map(neededMat => {
+                    const userHasQty = userInventory[neededMat.material_name.toLowerCase()] || 0;
+                    const quantityMissingForOneCraft = Math.max(0, neededMat.quantity - userHasQty);
+                    
+                    if (userHasQty < neededMat.quantity) {
+                        canCraftAnyWithCurrentMaterials = false;
+                    }
+                    if (neededMat.quantity > 0) { // Evitar divisão por zero
+                         const possibleCraftsWithThisMaterial = Math.floor(userHasQty / neededMat.quantity);
+                         if (possibleCraftsWithThisMaterial < craftableNowCount) {
+                             craftableNowCount = possibleCraftsWithThisMaterial;
+                         }
+                    } else if (neededMat.quantity === 0) { // Se a receita pede 0 de um material, não limita
+                        // craftableNowCount permanece como estava
+                    }
+                    return {
+                        material_name: neededMat.material_name,
+                        material_type: neededMat.material_type,
+                        quantity_needed_per_craft: neededMat.quantity,
+                        user_has_quantity: userHasQty,
+                        quantity_missing_for_one_craft: quantityMissingForOneCraft,
+                    };
+                });
+                
+                if (!canCraftAnyWithCurrentMaterials) {
+                    craftableNowCount = 0;
+                } else if (materialsNeededForThisRecipe.length === 0) { // Receita sem materiais
+                    craftableNowCount = Infinity;
+                } else if (craftableNowCount === Infinity && materialsNeededForThisRecipe.length > 0 && canCraftAnyWithCurrentMaterials) {
+                    // Se todos os materiais necessários têm quantidade 0 na receita, ou se o usuário tem "infinito" de todos.
+                    // Mais provável, se a receita tem materiais com quantidade > 0, craftableNowCount já teria um valor numérico.
+                    // Se chegou aqui como Infinity, e pode craftar (canCraftAnyWithCurrentMaterials), mas tem materiais,
+                    // isso indica um cenário onde as quantidades na receita são 0, ou algo não limitou.
+                    // Se a receita REALMENTE não tem materiais que limitam (ex: todos os mats da receita têm qtd 0), aí é Infinity.
+                    // Vamos assumir que, se tem materiais e pode craftar, mas não foi limitado, é ao menos 1 se todas as quantidades são 0 na receita
+                    // Mas o mais seguro é que se tem materiais e pode craftar, já deveria ter sido calculado.
+                    // Se ainda for Infinity, e tem materiais, é porque nenhum material foi um gargalo (quantidades na receita eram 0 ou o usuário tinha muito)
+                    // Para evitar Infinity real, se pode craftar e tem materiais, mas continua Infinity, significa que o gargalo não foi encontrado, o que pode ser 0 se as quantidades da receita forem >0
+                    // A lógica original de check-possibilities é mais direta para "craftableNowCount".
+                    // Replicando-a para este caso específico:
+                    if (materialsNeededForThisRecipe.length > 0) {
+                        let tempMaxCrafts = Infinity;
+                        for (const neededMat of materialsNeededForThisRecipe) {
+                            const userHasQty = userInventory[neededMat.material_name.toLowerCase()] || 0;
+                            if (userHasQty < neededMat.quantity) { tempMaxCrafts = 0; break; }
+                            if (neededMat.quantity > 0) {
+                                tempMaxCrafts = Math.min(tempMaxCrafts, Math.floor(userHasQty / neededMat.quantity));
+                            }
+                        }
+                        craftableNowCount = (tempMaxCrafts === Infinity && materialsNeededForThisRecipe.length > 0) ? 0 : tempMaxCrafts;
+                    } else {
+                        craftableNowCount = Infinity;
+                    }
+                }
+
+
+                analysisResults.push({
+                    recipe_id: recipe.id,
+                    recipe_name: recipe.name,
+                    quantity_produced_per_craft: recipe.quantity_produced,
+                    materials_analysis: materialsAnalysis,
+                    craftable_now_count: craftableNowCount
+                });
+            });
+            
+            res.json(analysisResults);
         });
     });
 });
